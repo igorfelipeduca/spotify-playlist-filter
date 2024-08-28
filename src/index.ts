@@ -4,12 +4,17 @@ import SpotifyWebApi from "spotify-web-api-node";
 import { getPublicPlaylist } from "./playlist/get-playlists";
 import dotenv from "dotenv";
 import { refreshAccessToken } from "./auth/refresh-token";
+import { getTrackDetails } from "./track/get-track-details";
+import { Context } from "hono";
 
 dotenv.config();
 
 const app = new Hono();
 
-async function setupSpotifyApi(c: any) {
+// Simple in-memory cache
+const cache: { [key: string]: any } = {};
+
+async function setupSpotifyApi(c: Context): Promise<SpotifyWebApi> {
   const refreshToken = c.req.header("Authorization")?.replace("Bearer ", "");
   if (!refreshToken) {
     throw new Error("No refresh token provided");
@@ -28,11 +33,30 @@ async function setupSpotifyApi(c: any) {
   return spotifyApi;
 }
 
-app.get("/", (c) => {
+async function rateLimitedRequest<T>(fn: () => Promise<T>): Promise<T> {
+  return fn();
+}
+
+async function getCachedOrFetch<T>(
+  key: string,
+  fetchFn: () => Promise<T>
+): Promise<T> {
+  if (cache[key]) {
+    return cache[key] as T;
+  }
+  const data = await rateLimitedRequest(fetchFn);
+  cache[key] = data;
+  return data;
+}
+
+app.get("/", (c: Context) => {
   return c.text("Hello Hono!");
 });
 
-app.post("/playlist/genres", async (c) => {
+app.post("/playlist/genres", async (c: Context) => {
+  const genres: string[] = [];
+  const readTracks: string[] = [];
+
   try {
     const spotifyApi = await setupSpotifyApi(c);
     const { playlistUrl } = await c.req.json();
@@ -40,27 +64,44 @@ app.post("/playlist/genres", async (c) => {
     const playlist = await getPublicPlaylist(spotifyApi, playlistUrl);
     const tracks = playlist.tracks.items;
 
-    const genres = new Set<string>();
+    for (const track of tracks) {
+      if (track.track) {
+        const trackDetails = await getCachedOrFetch(
+          `track:${track.track.id}`,
+          () => getTrackDetails(track?.track?.id ?? "", spotifyApi)
+        );
 
-    await Promise.all(
-      tracks.map(async (track) => {
-        if (track.track && track.track.album) {
-          const albumId = track.track.album.id;
-          const albumDetails = await spotifyApi.getAlbum(albumId);
-          const albumGenres = albumDetails.body.genres || [];
-          albumGenres.forEach((genre) => genres.add(genre));
+        console.log("Track details:", trackDetails);
+
+        const trackGenres = trackDetails.genres;
+
+        if (trackGenres && trackGenres.length > 0) {
+          trackGenres.forEach(
+            (genre) => !genres.includes(genre) && genres.push(genre)
+          );
+          readTracks.push(trackDetails.name);
+        } else {
+          console.log(`No genres found for track: ${trackDetails.name}`);
         }
-      })
-    );
-
-    return c.json({ genres: Array.from(genres) });
+      } else {
+        console.log("Skipping null track");
+      }
+    }
   } catch (error) {
-    console.error("Error fetching playlist genres:", error);
+    console.error(`Error in /playlist/genres: ${error}`);
     return c.json({ error: "Failed to fetch playlist genres" }, 500);
   }
+
+  console.log("Final genres:", Array.from(genres));
+  console.log("Read tracks:", Array.from(readTracks));
+
+  return c.json({
+    readTracks: Array.from(readTracks),
+    genres: Array.from(genres),
+  });
 });
 
-app.post("/playlist/filter", async (c) => {
+app.post("/playlist/filter", async (c: Context) => {
   try {
     const spotifyApi = await setupSpotifyApi(c);
     const { playlistUrl, genres } = await c.req.json();
@@ -70,28 +111,44 @@ app.post("/playlist/filter", async (c) => {
 
     const filteredTracks = await Promise.all(
       tracks.map(async (track) => {
-        if (!track.track || !track.track.album) return false;
+        if (!track.track) return null;
 
-        const albumId = track.track.album.id;
-        const albumDetails = await spotifyApi.getAlbum(albumId);
-        const trackGenres = albumDetails.body.genres || [];
+        const trackDetails = await getCachedOrFetch(
+          `track:${track.track.id}`,
+          () => getTrackDetails(track?.track?.id ?? "", spotifyApi)
+        );
 
-        return genres.some((genre: string) =>
+        const trackGenres = trackDetails.genres || [];
+
+        const matchesGenre = genres.some((genre: string) =>
           trackGenres.some((trackGenre) =>
             trackGenre.toLowerCase().includes(genre.toLowerCase())
           )
         );
+
+        return matchesGenre
+          ? {
+              id: track.track.id,
+              name: track.track.name,
+            }
+          : null;
       })
     );
 
-    return c.json({ filteredTracks: filteredTracks.filter(Boolean) });
+    const validFilteredTracks = filteredTracks.filter(Boolean);
+
+    return c.json({
+      filteredTracks: validFilteredTracks,
+      totalTracks: tracks.length,
+      matchingTracks: validFilteredTracks.length,
+    });
   } catch (error) {
-    console.error("Error filtering playlist:", error);
+    console.error(`Error in /playlist/filter: ${error}`);
     return c.json({ error: "Failed to filter playlist" }, 500);
   }
 });
 
-app.get("/login", (c) => {
+app.get("/login", (c: Context) => {
   const spotifyApi = new SpotifyWebApi({
     clientId: process.env.SPOTIFY_CLIENT_ID,
     clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
@@ -106,6 +163,36 @@ app.get("/login", (c) => {
   const state = "some-state-of-my-choice";
   const authorizeURL = spotifyApi.createAuthorizeURL(scopes, state);
   return c.redirect(authorizeURL);
+});
+
+app.get("/callback", async (c: Context) => {
+  const code = c.req.query("code");
+  if (!code) {
+    return c.json({ error: "Authorization code not found" }, 400);
+  }
+
+  const spotifyApi = new SpotifyWebApi({
+    clientId: process.env.SPOTIFY_CLIENT_ID,
+    clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+    redirectUri: process.env.SPOTIFY_REDIRECT_URI,
+  });
+
+  try {
+    const data = await spotifyApi.authorizationCodeGrant(code);
+    const { access_token, refresh_token, expires_in } = data.body;
+
+    spotifyApi.setAccessToken(access_token);
+    spotifyApi.setRefreshToken(refresh_token);
+
+    return c.json({
+      message: "Authentication successful",
+      access_token,
+      refresh_token,
+      expires_in,
+    });
+  } catch (error) {
+    return c.json({ error: "Failed to authenticate" }, 500);
+  }
 });
 
 const port = 8080;
