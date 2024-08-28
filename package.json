@@ -1,0 +1,17 @@
+{
+  "name": "spf-playlist",
+  "scripts": {
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.12.2",
+    "dotenv": "^16.4.5",
+    "hono": "^4.5.9",
+    "spotify-web-api-node": "^5.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.17",
+    "@types/spotify-web-api-node": "^5.0.11",
+    "tsx": "^4.7.1"
+  }
+}
