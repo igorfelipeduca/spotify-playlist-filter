@@ -6,6 +6,8 @@ import dotenv from "dotenv";
 import { refreshAccessToken } from "./auth/refresh-token";
 import { getTrackDetails } from "./track/get-track-details";
 import { Context } from "hono";
+import { addTrackToPlaylist } from "./track/add-track-to-playlist";
+import { createNewPlaylist } from "./playlist/create-playlist";
 
 dotenv.config();
 
@@ -148,6 +150,77 @@ app.post("/playlist/filter", async (c: Context) => {
   }
 });
 
+app.post("/playlist/create-filtered", async (c: Context) => {
+  try {
+    const spotifyApi = await setupSpotifyApi(c);
+
+    const { playlistUrl, genres, playlistName } = await c.req.json();
+
+    const playlist = await getPublicPlaylist(spotifyApi, playlistUrl);
+
+    const tracks = playlist.tracks.items;
+
+    const filteredTracks = await Promise.all(
+      tracks.map(async (track) => {
+        if (!track.track) return null;
+
+        const trackDetails = await getCachedOrFetch(
+          `track:${track.track.id}`,
+          () => getTrackDetails(track?.track?.id ?? "", spotifyApi)
+        );
+
+        const trackGenres = trackDetails.genres || [];
+
+        const matchesGenre = genres.some((genre: string) =>
+          trackGenres.some((trackGenre) =>
+            trackGenre.toLowerCase().includes(genre.toLowerCase())
+          )
+        );
+
+        return matchesGenre
+          ? {
+              uri: track.track.uri,
+              name: track.track.name,
+            }
+          : null;
+      })
+    );
+
+    const validFilteredTracks = filteredTracks.filter(Boolean);
+    const trackUris = validFilteredTracks.map((t) => t!.uri);
+
+    const newPlaylist = await createNewPlaylist(
+      spotifyApi,
+      playlistName,
+      "Playlist created using spotify-playlists.vercel.app by @ducaswtf"
+    );
+
+    if (newPlaylist) {
+      await spotifyApi.addTracksToPlaylist(newPlaylist.id, trackUris);
+
+      console.log(
+        `${validFilteredTracks.length} tracks added to playlist ${playlistName}`
+      );
+    } else {
+      return c.json(
+        { error: true, message: "Error while creating playlist" },
+        500
+      );
+    }
+
+    return c.json({ playlist: newPlaylist, tracks: validFilteredTracks });
+  } catch (error) {
+    console.error("Error in /playlist/create-filtered:", error);
+    return c.json(
+      {
+        error: true,
+        message: "An error occurred while processing your request",
+      },
+      500
+    );
+  }
+});
+
 app.get("/login", (c: Context) => {
   const spotifyApi = new SpotifyWebApi({
     clientId: process.env.SPOTIFY_CLIENT_ID,
@@ -159,6 +232,8 @@ app.get("/login", (c: Context) => {
     "user-read-private",
     "user-read-email",
     "playlist-read-private",
+    "playlist-modify-public",
+    "playlist-modify-private",
   ];
   const state = "some-state-of-my-choice";
   const authorizeURL = spotifyApi.createAuthorizeURL(scopes, state);

@@ -20,6 +20,7 @@ export async function getTrackDetails(
 
     return trackWithGenre;
   } catch (error: any) {
+    console.log(error);
     if (error.statusCode === 429) {
       const retryAfter = parseInt(error.headers["retry-after"]) || 1;
       console.log(`Rate limited. Retrying after ${retryAfter} seconds.`);
